@@ -10,9 +10,9 @@ To run the project use the following commands:
 
 Build:
 ```shell
-docker compose build
+docker-compose build
 ```
 Run:
 ```shell
-docker compose up
+docker-compose up
 ```
