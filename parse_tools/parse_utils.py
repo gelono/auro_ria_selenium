@@ -1,106 +1,133 @@
-import requests
-import os
-from dotenv import load_dotenv
-import asyncio
+import random
+import threading
 import time
+from selenium.webdriver.support.wait import WebDriverWait
+from selenium.webdriver.chrome.options import Options as chrome_options
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service as ChromeService
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.by import By
+from fake_useragent import UserAgent
+import os
+import subprocess
+from dotenv import load_dotenv
 
-from db_tools.db_tools import get_site_ids, insert_into_cars, get_data_of_single_id, update_data
-from tg_tools.tg_tools import notify_user
+from db_tools.db_tools import Connect
+from parse_tools.page_processing import PageProcessing
+
+# Load the environment variables from the .env file
 load_dotenv()
+CHROME_PROFILE_PATH = os.getenv("CHROME_PROFILE_PATH")
+BOT_NUMBERS = int(os.getenv("BOT_NUMBERS"))
+DB_HOST = os.getenv("DB_HOST")
+DB_USER = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+DB_NAME = os.getenv("DB_NAME")
+DB_PORT = int(os.getenv("DB_PORT"))
 
+class ParseUtils:
+    @staticmethod
+    def get_driver(bot: int, headless=False):
+        ua = UserAgent()
+        random_user_agent = ua.random
 
-API_KEY = os.environ.get('API_KEY')
-CATEGORY_ID = 1  # Легковые авто
-MARK_ID = 79  # Toyota
-MODEL_ID = 2104  # Sequoia
-DAMAGE = 1  # После ДТП
-MATCH_COUNT = 840  # Пригнаны из США
-COUNTPAGE = 100  # Кол-во результатов на странице
+        options = chrome_options()
+        options.add_argument(f"user-agent={random_user_agent}")
+        options.add_argument("--headless") if headless else None
+        options.add_argument(f"user-data-dir={CHROME_PROFILE_PATH}/AutoriaProfile_{bot}")
+        options.add_argument('--start-maximized')
+        driver = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=options)
 
+        return driver
 
-def make_request(url):
-    try:
-        response = requests.get(url)
-        if response.status_code < 300:
-            return response.json()
-        else:
-            print(f"Request failed with status code: {response.status_code}")
-    except requests.RequestException as e:
-        print(f"Request failed: {e}")
-    return None
+    @staticmethod
+    def get_data_from_the_page(driver: webdriver.Chrome):
+        page_proc = PageProcessing(driver)
+        data_dict = dict()
+        data_dict['url'] = driver.current_url
+        data_dict['title'] = page_proc.get_title()
+        data_dict['price_usd'] = page_proc.get_price_usd()
+        data_dict['odometer'] = page_proc.get_odometer()
+        data_dict['username'] = page_proc.get_username()
+        data_dict['image_url'], data_dict['images_count'] = page_proc.get_image_url_count()
+        data_dict['car_number'] = page_proc.get_car_number()
+        data_dict['car_vin'] = page_proc.get_car_vin()
+        data_dict['phone_number'] = page_proc.get_phone_number()
 
+        return data_dict
 
-def get_data_by_site_id(id_num):
-    title = year = price = race = city = link = 'Unknown'
-    photo_links = []
+    def parse_data(self, list_of_links: list, bot_num: int, start_index: int, step: int, connection: Connect, sleep=0.5):
+        driver = self.get_driver(bot_num, headless=True)
+        list_for_post = []
+        loop = 0
+        for i in range(start_index, len(list_of_links), step):
+            loop += 1
+            print(f'Bot#{bot_num}: loop - {loop}')
+            time.sleep(sleep)
+            driver.get(list_of_links[i])
+            data_dict = self.get_data_from_the_page(driver)
+            list_for_post.append(data_dict)
 
-    url = f'https://developers.ria.com/auto/info?api_key={API_KEY}&auto_id={id_num}'
+        try:
+            connection.alchemy_post_mult_data('public', 'info', list_for_post)
+            print('Data has been inserted into DB')
+        except Exception:
+            print('Error while working with DB')
 
-    data = make_request(url)
+    @staticmethod
+    def get_links(wait: WebDriverWait):
+        links = wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, 'a[class="m-link-ticket"]')))
+        links = [element.get_attribute('href') for element in links]
+        return links
 
-    if data:
-        price = data.get('USD', 0.0)
-        link_to_view = data.get('linkToView', '')
-        link = f'https://auto.ria.com/{link_to_view}'
-        title = data.get('title', 'Unknown')
-        year = data.get('autoData').get('year', 'Unknown')
-        city = data.get('stateData', {}).get('name', 'Unknown')
-        race = data.get('autoData', {}).get('race', 'Unknown')
+    @staticmethod
+    def pages_count(wait: WebDriverWait):
+        propositions = wait.until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, 'span[id="floatingSearchResultsCount"]'))).text
+        propositions = int(propositions.replace(' ', ''))
+        pages = 1 + (propositions // 100) if propositions % 100 > 0 else propositions // 100
+        return pages
 
-        album = data.get('photoData', {}).get('all', [])
-        if album:
-            for i in range(5):
-                try:
-                    photo = f'https://cdn2.riastatic.com/photosnew/auto/photo/toyota_sequoia__{album[i]}f.jpg'
-                except IndexError:
-                    break
-                else:
-                    photo_links.append(photo)
+    def manager(self):
+        driver = self.get_driver(0)
+        driver.get(f'https://auto.ria.com/uk/search/?lang_id=4&page={0}&countpage=100&indexName=auto&custom=1&abroad=2')
+        time.sleep(1)
+        wait = WebDriverWait(driver, 5)
 
-    return title, year, price, race, city, link, photo_links
+        pages = self.pages_count(wait)
+        connection = Connect()
+        for i in range(pages):
+            driver.get(f'https://auto.ria.com/uk/search/?lang_id=4&page={i}&countpage=100&indexName=auto&custom=1&abroad=2')
+            links = self.get_links(wait)
+            self.run_threads(connection, BOT_NUMBERS, links)
 
+    def run_threads(self, connection: Connect, bot_numbers: int, links: list):
+        threads = []
+        random_sleep = [0.2, 0.3, 0.4]
+        for i in range(bot_numbers):
+            t = threading.Thread(target=self.parse_data,
+                                 args=(links, i+1, i, bot_numbers, connection, random.choice(random_sleep)))
+            threads.append(t)
+            t.start()
+        for thread in threads:
+            thread.join()
 
-def process_item(r_id, resp_ids, site_ids, adds):
-    r_id_title, r_id_year, r_id_price, r_id_race, r_id_city, r_id_link, photo_links = get_data_by_site_id(r_id)
-    loop = asyncio.get_event_loop()
-    if r_id not in site_ids:
-        loop.run_until_complete(notify_user(
-            r_id_title, r_id_year, r_id_price, r_id_race, r_id_city, r_id_link, photo_links))
+    @staticmethod
+    def bd_dump():
+        output_file = 'backup.dump'
+        try:
+            command = [
+                'pg_dump',
+                '-h', 'localhost',
+                '-U', DB_USER,
+                '-d', DB_NAME,
+                '-F', 'c',  # dump format (custom)
+                '-f', output_file
+            ]
 
-        adds.append((r_id, r_id_price))
-    else:
-        price_db = get_data_of_single_id(r_id)
-        if price_db != r_id_price:
-            loop.run_until_complete(notify_user(
-                r_id_title, r_id_year, r_id_price, r_id_race, r_id_city, r_id_link, photo_links,
-                'ПОНОВЛЕННЯ ЦIНИ!!!:\n'))
-            update_data('price', r_id_price, r_id)
+            subprocess.run(command, check=True)
 
-    for s_id in site_ids:
-        if s_id not in resp_ids:
-            loop.run_until_complete(notify_user(
-                r_id_title, r_id_year, r_id_price, r_id_race, r_id_city, r_id_link, photo_links,
-                'ПРОДАНО!!!\n'))
-            update_data('status', '"sold"', s_id)
-
-
-def auto_ria_parse(pause):
-    url = f"https://developers.ria.com/auto/search?api_key={API_KEY}&category_id={CATEGORY_ID}&marka_id={MARK_ID}" \
-          f"&model_id={MODEL_ID}&damage={DAMAGE}&matched_country={MATCH_COUNT}&countpage={COUNTPAGE}"
-
-    data = make_request(url)
-
-    if data:
-        resp_ids = data.get('result', {}).get('search_result', {}).get('ids', [])
-        if resp_ids:
-            site_ids = get_site_ids()
-            adds = []
-            for r_id in resp_ids:
-                process_item(r_id, resp_ids, site_ids, adds)
-
-            if adds:
-                insert_into_cars(adds)
-
-    time.sleep(pause)
-
-    return auto_ria_parse(pause)
+            print(f"DB dump '{DB_NAME}' has been created in '{output_file}'")
+        except Exception as e:
+            print(f"Error while dump creating: {e}")
